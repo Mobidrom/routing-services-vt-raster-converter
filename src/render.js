@@ -6,15 +6,22 @@ const sharp = require('sharp');
 const zlib = require('zlib');
 const mbgl = require('@maplibre/maplibre-gl-native');
 const MBTiles = require('@mapbox/mbtiles');
+const { PMTiles } = require('pmtiles');
 const axios = require('axios');
 
 const logger = require('./logger');
 const config = require('./config/config.json');
 
 const isMBTilesURL = (url) => url.startsWith('mbtiles://');
+const isPMTilesURL = (url) => url.startsWith('pmtiles://');
+const isRemotePMTilesURL = (url) => url.startsWith(`pmtiles://https://`)
+
+// Cache for PMTiles instances to avoid reopening files
+const pmtilesCache = new Map();
+const remotePmtilesCache = new Map();
 
 /**
- * Splits out mbtiles name from the URL
+ * Splits out tile archive name from the URL
  *
  * @param {string} url - URL to resolve
  */
@@ -36,6 +43,68 @@ const resolveMBTilesURL = (tilePath, url) => {
 
     logger.debug('Resolved MBTiles URL: ' + mbTilesURL);
     return mbTilesURL;
+};
+
+/**
+ * Resolve a URL of a local pmtiles file to a file path
+ * Expected to follow this format "pmtiles://<pmtiles_file>"
+ *
+ * @param {string} tilePath - path containing pmtiles files
+ * @param {string} url - url of a data source in style.json file
+ */
+const resolvePMTilesURL = (tilePath, url) => {
+    const pmTilesURL = path.format({
+        dir: tilePath,
+        name: resolveNamefromURL(url),
+        ext: '.pmtiles',
+    });
+
+    logger.debug('Resolved PMTiles URL: ' + pmTilesURL);
+    return pmTilesURL;
+};
+
+/**
+ * Get or create a PMTiles instance from cache
+ * For local files, we need to provide a custom source
+ *
+ * @param {string} filepath - path to pmtiles file
+ */
+const getPMTilesInstance = async (filepath) => {
+    if (!pmtilesCache.has(filepath)) {
+        logger.debug(`Creating new PMTiles instance for: ${filepath}`);
+
+        // Create a custom source for reading local files
+        const source = {
+            getKey: () => filepath,
+            getBytes: async (offset, length) => {
+                const fd = await fs.promises.open(filepath, 'r');
+                try {
+                    const buffer = Buffer.alloc(length);
+                    const { bytesRead } = await fd.read(buffer, 0, length, offset);
+                    
+                    // Convert Node.js Buffer to ArrayBuffer
+                    const arrayBuffer = buffer.buffer.slice(
+                        buffer.byteOffset,
+                        buffer.byteOffset + bytesRead
+                    );
+                    
+                    return {
+                        data: arrayBuffer,
+                        etag: undefined,
+                        cacheControl: undefined,
+                        expires: undefined
+                    };
+                } finally {
+                    await fd.close();
+                }
+            }
+        };
+
+        const pmtiles = new PMTiles(source);
+
+        pmtilesCache.set(filepath, pmtiles);
+    }
+    return pmtilesCache.get(filepath);
 };
 
 /**
@@ -83,6 +152,168 @@ const getLocalTileJSON = (tilePath, url, callback) => {
 };
 
 /**
+ * Given a URL to a local pmtiles file, get the TileJSON for that to load correct tiles.
+ *
+ * @param {string} tilePath - path containing pmtiles files
+ * @param {string} url - url of a data source in style.json file
+ * @param {function} callback - function to call with (err, {data})
+ */
+const getLocalPMTileJSON = async (tilePath, url, callback) => {
+    try {
+        const pmtilesFilename = resolvePMTilesURL(tilePath, url);
+        const service = resolveNamefromURL(url);
+        
+        const pmtiles = await getPMTilesInstance(pmtilesFilename);
+        const header = await pmtiles.getHeader();
+        const metadata = await pmtiles.getMetadata();
+        
+        // Determine tile format from header
+        const tileType = header.tileType;
+        let ext = '';
+        
+        // tileType: 1 = MVT (Mapbox Vector Tile), 2 = PNG, 3 = JPEG, 4 = WEBP
+        if (tileType === 1) {
+            ext = '.mvt';
+        } else {
+            throw new Error('PMTiles file contains unsupported tileType for rendering!');
+        }
+
+        const tileJSON = {
+            tilejson: '1.0.0',
+            tiles: [`pmtiles://${service}/{z}/{x}/{y}${ext}`],
+            minzoom: header.minZoom || 0,
+            maxzoom: header.maxZoom || 14,
+            center: metadata.center || [0, 0],
+            bounds: metadata.bounds || [-180, -85.0511, 180, 85.0511],
+        };
+
+        callback(null, { data: Buffer.from(JSON.stringify(tileJSON)) });
+    } catch (err) {
+        logger.error(`Error creating TileJSON for PMTiles file: ${err}`);
+        callback(err);
+    }
+};
+
+/**
+ * Given a URL to a remote pmtiles file, get the TileJSON for that to load correct tiles.
+ *
+ * @param {string} url - url of a data source in style.json file (format: 'pmtiles://https://...')
+ * @param {function} callback - function to call with (err, {data})
+ */
+const getRemotePMTileJSON = async (url, callback) => {
+    logger.debug("Preparing remote PMTile TileJSON with ${url}")
+    try {
+        // Extract the remote HTTPS URL from the pmtiles:// prefix
+        if (!url.startsWith('pmtiles://')) {
+            throw new Error('URL must start with pmtiles://');
+        }
+        
+        const remoteUrl = url.substring('pmtiles://'.length);
+        
+        // Validate it's an HTTP(S) URL
+        if (!remoteUrl.startsWith('http://') && !remoteUrl.startsWith('https://')) {
+            throw new Error('Remote URL must be an HTTP or HTTPS URL');
+        }
+        
+        // Create PMTiles instance with the remote URL
+        // PMTiles constructor accepts a URL string directly and creates FetchSource
+        const pmtiles = new PMTiles(remoteUrl);
+        const header = await pmtiles.getHeader();
+        const metadata = await pmtiles.getMetadata();
+
+        // Determine tile format from header
+        const tileType = header.tileType;
+        let ext = '';
+
+        // tileType: 1 = MVT (Mapbox Vector Tile), 2 = PNG, 3 = JPEG, 4 = WEBP
+        if (tileType === 1) {
+            ext = '.mvt';
+        } else {
+            throw new Error('PMTiles file contains unsupported tileType for rendering!');
+        }
+        
+        const tileJSON = {
+            tilejson: '1.0.0',
+            tiles: [`${url}/{z}/{x}/{y}${ext}`],
+            minzoom: header.minZoom || 0,
+            maxzoom: header.maxZoom || 14,
+            center: metadata.center || [0, 0],
+            bounds: metadata.bounds || [-180, -85.0511, 180, 85.0511],
+        };
+        
+        callback(null, { data: Buffer.from(JSON.stringify(tileJSON)) });
+    } catch (err) {
+        logger.error(`Error creating TileJSON for remote PMTiles file: ${err}`);
+        callback(err);
+    }
+};
+
+/**
+ * Given a URL template to a remote tile server, get the TileJSON for that to load correct tiles.
+ *
+ * @param {string} url - url template of a tile server (format: 'https://tileserver.com/tiles/{z}/{x}/{y}.mvt')
+ * @param {function} callback - function to call with (err, {data})
+ */
+const getRemoteTileJSON = async (url, callback) => {
+    logger.debug(`Preparing remote tile server TileJSON with ${url}`);
+    try {
+        // Validate it's an HTTP(S) URL
+        if (!url.startsWith('http://') && !url.startsWith('https://')) {
+            throw new Error('Remote URL must be an HTTP or HTTPS URL');
+        }
+        
+        // Check if URL contains tile template placeholders
+        if (!url.includes('{z}') || !url.includes('{x}') || !url.includes('{y}')) {
+            throw new Error('URL must contain {z}, {x}, and {y} placeholders');
+        }
+        
+        // Determine tile format from URL extension
+        const ext = path.extname(url.split('{')[0]); // Get extension before placeholders
+        let format = 'pbf'; // default for vector tiles
+        
+        if (url.includes('.mvt') || url.includes('.pbf')) {
+            format = 'pbf';
+        } else {
+            throw new Error('Only tileservers delivering vector tiles are supported');
+        }       
+        // Create TileJSON with default values for remote tile servers
+        // Note: Without accessing the tile server's metadata endpoint,
+        // we use sensible defaults
+        const tileJSON = {
+            tilejson: '2.2.0',
+            tiles: [url],
+            minzoom: 0,
+            maxzoom: 14,
+            bounds: [-180, -85.0511, 180, 85.0511],
+            center: [0, 0, 2],
+            format: format,
+        };
+        
+        // // Optionally, try to fetch TileJSON from the server if it exists
+        // // Many tile servers provide a TileJSON endpoint
+        try {
+            const baseUrl = url.split('/{z}')[0]; // Get base URL before tile template
+            const tileJsonUrl = `${baseUrl}.json`;
+            
+            const response = await fetch(tileJsonUrl);
+            if (response.ok) {
+                const remoteTileJSON = await response.json();
+                logger.debug(`Retrieved TileJSON from ${tileJsonUrl}`);
+                callback(null, { data: Buffer.from(JSON.stringify(remoteTileJSON)) });
+                return;
+            }
+        } catch (fetchErr) {
+            logger.debug(`No TileJSON endpoint found, using defaults: ${fetchErr.message}`);
+        }
+        
+        callback(null, { data: Buffer.from(JSON.stringify(tileJSON)) });
+    } catch (err) {
+        logger.error(`Error creating TileJSON for remote tile server: ${err}`);
+        callback(err);
+    }
+};
+
+/**
  * Fetch a tile from a local mbtiles file.
  *
  * @param {string} tilePath - path containing mbtiles files
@@ -123,6 +354,119 @@ const getLocalTile = (tilePath, url, callback) => {
 
         return null;
     });
+};
+
+/**
+ * Fetch a tile from a local pmtiles file.
+ *
+ * @param {string} tilePath - path containing pmtiles files
+ * @param {string} url - url of a data source in style.json file
+ * @param {function} callback - function to call with (err, {data})
+ */
+const getLocalPMTile = async (tilePath, url, callback) => {
+    try {
+        const matches = url.match(RegExp('pmtiles://([^/]+)/(\\d+)/(\\d+)/(\\d+)'));
+        if (!matches) {
+            throw new Error(`Invalid PMTiles URL format: ${url}`);
+        }
+
+        const [z, x, y] = matches.slice(matches.length - 3, matches.length).map(Number);
+        const isVector = path.extname(url) === '.mvt';
+        const pmtilesFile = resolvePMTilesURL(tilePath, url);
+
+        const pmtiles = await getPMTilesInstance(pmtilesFile);
+        
+        const tileData = await pmtiles.getZxy(z, x, y);
+
+        if (!tileData || !tileData.data) {
+            logger.warn(`tile not found: z:${z} x:${x} y:${y} from ${pmtilesFile}`);
+            callback(null, {});
+            return;
+        }
+
+        // PMTiles tiles are already in the correct format
+        // Vector tiles in PMTiles are typically gzip compressed
+        if (isVector) {
+            // Check if data needs decompression
+            zlib.gunzip(Buffer.from(tileData.data), (unzipErr, unzippedData) => {
+                if (unzipErr) {
+                    // If gunzip fails, the data might already be uncompressed
+                    logger.debug(`Tile appears to be uncompressed, using as-is`);
+                    callback(null, { data: Buffer.from(tileData.data) });
+                } else {
+                    callback(null, { data: unzippedData });
+                }
+            });
+        } else {
+            callback(null, { data: Buffer.from(tileData.data) });
+        }
+    } catch (err) {
+        logger.error(`Error fetching PMTile: ${err}`);
+        callback(err);
+    }
+};
+
+/**
+ * Get or create a cached PMTiles instance for a remote URL
+ */
+const getRemotePMTilesInstance = async (remoteUrl) => {
+    if (!remotePmtilesCache.has(remoteUrl)) {
+        logger.debug(`Creating new remote PMTiles instance for: ${remoteUrl}`);
+        const pmtiles = new PMTiles(remoteUrl);
+        remotePmtilesCache.set(remoteUrl, pmtiles);
+    }
+    return remotePmtilesCache.get(remoteUrl);
+};
+
+/**
+ * Fetch a tile from a remote pmtiles file on S3.
+ *
+ * @param {string} url - url of a tile request (format: 'pmtiles://https://.../map.pmtiles/{z}/{x}/{y}.mvt')
+ * @param {function} callback - function to call with (err, {data})
+ */
+const getRemotePMTile = async (url, callback) => {
+    try {
+        const matches = url.match(/^pmtiles:\/\/(https?:\/\/.+?)\/(\d+)\/(\d+)\/(\d+)/);
+        if (!matches) {
+            throw new Error(`Invalid PMTiles URL format: ${url}`);
+        }
+        
+        const remoteUrl = matches[1]; 
+        const z = Number(matches[2]);
+        const x = Number(matches[3]);
+        const y = Number(matches[4]);
+        const isVector = path.extname(url) === '.mvt';
+        
+        // Get cached PMTiles instance
+        const pmtiles = await getRemotePMTilesInstance(remoteUrl);
+        
+        const tileData = await pmtiles.getZxy(z, x, y);
+        if (!tileData || !tileData.data) {
+            logger.warn(`tile not found: z:${z} x:${x} y:${y} from ${remoteUrl}`);
+            callback(null, {});
+            return;
+        }
+        
+        // PMTiles tiles are already in the correct format
+        // Vector tiles in PMTiles are typically gzip compressed
+        if (isVector) {
+            // Check if data needs decompression
+            zlib.gunzip(Buffer.from(tileData.data), (unzipErr, unzippedData) => {
+                if (unzipErr) {
+                    // If gunzip fails, the data might already be uncompressed
+                    logger.debug(`Tile appears to be uncompressed, using as-is`);
+                    callback(null, { data: Buffer.from(tileData.data) });
+                } else {
+                    callback(null, { data: unzippedData });
+                }
+            });
+        } else {
+            callback(null, { data: Buffer.from(tileData.data) });
+        }
+    } catch (err) {
+        logger.error(`Error fetching remote PMTile: ${err}`);
+        callback(err);
+    }
 };
 
 /**
@@ -214,7 +558,7 @@ const getRemoteAsset = async (url, callback) => {
 
 /**
  * Constructs a request handler for the map to load resources.
- * @param {*} tilePath - path containing mbtiles files
+ * @param {*} dataPath - path to data directory
  * @returns requestHandler object
  */
 const requestHandler =
@@ -229,17 +573,37 @@ const requestHandler =
                 case 2: {
                     // source
                     if (isMBTilesURL(url)) {
-                        getLocalTileJSON(path.join(dataPath + '/tiles'), url, callback);
+                        logger.info("Local MBTiles TileJSON")
+                        getLocalMBTileJSON(path.join(dataPath + '/tiles'), url, callback);
+                    } else if (isPMTilesURL(url)) {
+                        if (isRemotePMTilesURL(url)) {
+                            logger.info("Remote PMTiles TileJSON")
+                            getRemotePMTileJSON(url, callback);
+                        } else {
+                            logger.info("Local PMTiles TileJSON")
+                            getLocalPMTileJSON(path.join(dataPath + '/tiles'), url, callback);
+                        }
                     } else {
-                        getRemoteAsset(url, callback);
+                        logger.info("Remote TileJSON")
+                        getRemoteTileJSON(url, callback);
                     }
                     break;
                 }
                 case 3: {
                     // tile
                     if (isMBTilesURL(url)) {
+                        logger.info("Local MBTiles tile")
                         getLocalTile(path.join(dataPath + '/tiles'), url, callback);
+                    } else if (isPMTilesURL(url)) {
+                        if (isRemotePMTilesURL(url)) {
+                            logger.info("Remote PMTiles Tile")
+                            getRemotePMTile(url, callback);
+                        } else {
+                            logger.info("Local PMTiles tile")
+                            getLocalPMTile(path.join(dataPath + '/tiles'), url, callback);
+                        }
                     } else {
+                        logger.info("Remote tile")
                         getRemoteTile(url, callback);
                     }
                     break;
@@ -459,4 +823,18 @@ const renderMap = (map, options) => {
     });
 };
 
-module.exports = { renderImage, resolveNamefromURL, resolveMBTilesURL };
+/**
+ * Clear PMTiles cache (useful for cleanup)
+ */
+const clearPMTilesCache = () => {
+    pmtilesCache.clear();
+    logger.debug('clearPMTilesCache - PMTiles cache cleared');
+};
+
+module.exports = { 
+    renderImage, 
+    resolveNamefromURL, 
+    resolveMBTilesURL, 
+    resolvePMTilesURL,
+    clearPMTilesCache 
+};
